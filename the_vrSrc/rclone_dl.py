@@ -3,43 +3,66 @@ from rclone_fp import make_rclone
 import logging
 import json
 import base64
-import hashlib
 import re
+import sys
 from pathlib import Path
 from urllib.parse import urljoin
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "vrp-public.json"
 
+API_BASE = "https://vrsrc.fyi"
+
 def download(name: str):
     session = make_rclone()
 
+    # Load config
     if not CONFIG_PATH.exists():
-        logging.info("vrp-public.json not fucking found, fucking downloading it right now")
-        logging.error("download and place the fucking json file in directory, but called vrp-public.json")
+        logging.error("vrp-public.json not found")
         return
-    else:
-        try:
-            with CONFIG_PATH.open("r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as e:
-            raise RuntimeError("Invalid vrp-public.json stupid fuck") from e
-        
+
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        raise RuntimeError("Invalid vrp-public.json") from e
+
     base_url = config["baseUri"]
     encoded_password = config["password"]
-
     password = base64.b64decode(encoded_password).decode("utf-8").strip()
 
-    md5 = hashlib.md5()
-    md5.update((name + "\n").encode("utf-8"))
-    hash_value = md5.hexdigest()
+    # Search game via vrsrc.fyi API to get the folderhash
+    logging.info(f"Searching for '{name}'...")
+    import urllib.parse
+    search_url = f"{API_BASE}/api/games/search?q={urllib.parse.quote(name)}&limit=20"
+    r = session.get(search_url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    games = data.get("data", data if isinstance(data, list) else [])
 
-    index_url = f"{base_url}{hash_value}/"
+    if not games:
+        raise RuntimeError(f"No games found for '{name}'")
 
-    output_dir = SCRIPT_DIR / hash_value
+    # Filter to games with a folderhash, prefer latest version
+    candidates = [g for g in games if g.get("folderhash")]
+    if not candidates:
+        raise RuntimeError(f"No downloadable versions found for '{name}'")
+
+    # Pick the one with highest versioncode
+    candidates.sort(key=lambda g: int(g.get("versioncode") or 0), reverse=True)
+    game = candidates[0]
+    folderhash = game["folderhash"]
+    display_name = game.get("friendlyname") or game.get("gamename") or game.get("packagename", name)
+    logging.info(f"Found: {display_name} (v{game.get('versioncode', '?')})")
+    logging.info(f"Folder hash: {folderhash}")
+
+    index_url = f"{base_url}{folderhash}/"
+    output_dir = SCRIPT_DIR / folderhash
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    r = session.get(index_url)
+    # Fetch directory listing from CDN
+    logging.info(f"Fetching {index_url}...")
+    r = session.get(index_url, timeout=15)
     r.raise_for_status()
 
     files = re.findall(r'href="([^"]+)"', r.text)
@@ -54,10 +77,7 @@ def download(name: str):
         raise RuntimeError("No fucking parts found")
 
     l_parts = len(parts)
-    if l_parts > 1:
-        logging.info(f"Found {l_parts} fucking files")
-    else:
-        logging.info(f"Found {l_parts} fucking file")
+    logging.info(f"Found {l_parts} fucking file{'s' if l_parts > 1 else ''}")
 
     for filename in parts:
         file_url = urljoin(index_url, filename)
@@ -65,7 +85,7 @@ def download(name: str):
 
         logging.info(f"Fucking downloading {filename}...")
 
-        resp = session.get(file_url, stream=True)
+        resp = session.get(file_url, stream=True, timeout=300)
         resp.raise_for_status()
         with output_path.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
